@@ -21,7 +21,7 @@ const CONFIG = {
   QUEUE_SHEET_NAME: "_QUEUE",
 
   // 作るジョブ種別（A/B/C）
-  JOB_TYPES: ["A_HTML_GITHUB", "B_BLOG_WP", "CC_SLIDES_GEN"],
+  JOB_TYPES: ["A_HTML_GITHUB", "B_BLOG_WP", "C_SLIDES_GEN"],
 };
 
 /**

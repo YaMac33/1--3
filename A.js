@@ -29,18 +29,15 @@ const A_CONFIG = {
 
   // GitHub Pages（コミット先）
   GITHUB: {
-    OWNER: "PUT_OWNER",
-    REPO: "PUT_REPO",
+    OWNER: "YaMac33",
+    REPO: "1--3",
     BRANCH: "main",
-
-    // 例: "index.html" もしくは "docs/index.html"
-    // GitHub Pages設定に合わせてください
-    FILE_PATH: "index.html",
 
     // Script Propertiesに入れるキー名
     TOKEN_PROP_KEY: "GITHUB_TOKEN",
 
     // ページURL（結果として記録したい場合用。Queueに保存する場合は拡張で可能）
+    // ★ここは自分のPages URLに置き換え
     PAGES_URL: "https://PUT_OWNER.github.io/PUT_REPO/",
   },
 
@@ -56,14 +53,18 @@ const A_CONFIG = {
  * Aワーカー（時間主導トリガー推奨）
  * - _QUEUEから A_HTML_GITHUB の PENDING/ERROR を拾う
  * - retryCount が上限超えたものはスキップ
+ *
+ * ※ 今は runWorker() を使ってるはずですが、
+ *   こちらも残すなら CONFIG 参照を排除しておく（事故防止）
  */
 function runAWorker_() {
   const lock = LockService.getDocumentLock();
   lock.waitLock(30 * 1000);
 
   try {
-    const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
-    const q = ss.getSheetByName(CONFIG.QUEUE_SHEET_NAME);
+    // ★CONFIG ではなく WORKER_CONFIG を参照
+    const ss = SpreadsheetApp.openById(WORKER_CONFIG.SPREADSHEET_ID);
+    const q = ss.getSheetByName(WORKER_CONFIG.QUEUE_SHEET_NAME);
     if (!q) throw new Error("Queue sheet not found. Run initQueueAndTrigger() first.");
 
     const lastRow = q.getLastRow();
@@ -140,17 +141,24 @@ function runAWorker_() {
 function executeAHtmlGithub_({ jobId, theme, payload }) {
   const html = generateHtmlFromTheme_(theme, payload);
 
-  const sha = upsertFileToGitHub_(
+  const filePath = buildFilePathFromJobId_(jobId);
+
+  upsertFileToGitHub_(
     A_CONFIG.GITHUB.OWNER,
     A_CONFIG.GITHUB.REPO,
     A_CONFIG.GITHUB.BRANCH,
-    A_CONFIG.GITHUB.FILE_PATH,
+    filePath,
     html,
-    `A_HTML_GITHUB: update ${A_CONFIG.GITHUB.FILE_PATH} (jobId=${jobId})`
+    `A_HTML_GITHUB: create ${filePath} (jobId=${jobId})`
   );
 
-  Logger.log(`committed sha=${sha}`);
-  return A_CONFIG.GITHUB.PAGES_URL;
+  const pageUrl =
+    A_CONFIG.GITHUB.PAGES_URL + filePath.replace(/^docs\//, "").replace(/index\.html$/, "");
+
+  // ★docs/index.html を _QUEUE から再生成して更新
+  updateDocsIndexFromQueue_();
+
+  return pageUrl;
 }
 
 // ===== HTML生成（まずはスタブ。後でAIに差し替え） =====
@@ -340,8 +348,8 @@ function runWorker() {
       try {
         const payload = JSON.parse(row[idx.payloadJson] || "{}");
 
-        // ★ここに本処理を差し込む（今はダミー）
-        doJob_(payload);
+        const jobId = row[idx.jobId]; // jobId 列を使う
+        doJob_(payload, jobId);
 
         updateQueueRow_(q, sheetRow, idx, { status: "DONE", updatedAt: new Date() });
       } catch (err) {
@@ -363,18 +371,11 @@ function runWorker() {
   }
 }
 
-/**
- * 本処理（まずはダミーでOK）
- * payload.namedValues などからテーマを取り出して処理する想定
- */
-function doJob_(payload) {
-  // 例：フォームの設問「テーマ」を取り出す（存在しない場合もあるので注意）
-  const nv = payload.namedValues || {};
-  const themeArr = nv["テーマ"] || nv["theme"] || [];
-  const theme = Array.isArray(themeArr) ? themeArr[0] : "";
+function doJob_(payload, jobId) {
+  const theme = getThemeFromPayload_(payload);
 
-  Logger.log(`[${JOB_TYPE}] doing job... theme=${theme}`);
-  // TODO: A/B/C の実処理に置き換える
+  // 既存本体を呼ぶ
+  executeAHtmlGithub_({ jobId, theme, payload });
 }
 
 /** ヘッダ名→列index */
@@ -382,7 +383,7 @@ function indexMap_(header) {
   const map = {};
   header.forEach((h, i) => map[String(h).trim()] = i);
 
-  const required = ["jobType","status","payloadJson","retryCount","lastError","updatedAt"];
+  const required = ["jobId","jobType","status","payloadJson","retryCount","lastError","updatedAt"];
   required.forEach(k => {
     if (!(k in map)) throw new Error(`Queue header missing: ${k}`);
   });
@@ -398,4 +399,154 @@ function updateQueueRow_(sheet, rowNum, idx, patch) {
   if (patch.retryCount != null) sheet.getRange(rowNum, idx.retryCount + 1).setValue(patch.retryCount);
   if (patch.lastError != null) sheet.getRange(rowNum, idx.lastError + 1).setValue(patch.lastError);
   sheet.getRange(rowNum, idx.updatedAt + 1).setValue(now);
+}
+
+function getThemeFromPayload_(payload) {
+  const nv = (payload && payload.namedValues) ? payload.namedValues : {};
+  const v = nv["テーマ"];
+
+  const theme = Array.isArray(v) ? String(v[0] || "").trim() : String(v || "").trim();
+
+  if (!theme) {
+    throw new Error("テーマが空です。フォーム項目名が「テーマ」か、payload.namedValues に入っているか確認してください。");
+  }
+  return theme;
+}
+
+/**
+ * jobId → GitHub Pages用のファイルパスを作る
+ * Pages = docs 配下 前提
+ */
+function buildFilePathFromJobId_(jobId) {
+  const safe = String(jobId).replace(/[^a-zA-Z0-9-_]/g, "_");
+  return `docs/${safe}/index.html`;
+}
+
+/**
+ * _QUEUE を元に docs/index.html を再生成して GitHub に反映
+ * - A_HTML_GITHUB の DONE のみ
+ * - 新しい順（createdAt降順）
+ */
+function updateDocsIndexFromQueue_() {
+  // ★CONFIG ではなく WORKER_CONFIG を参照（ここが今回の修正の肝）
+  const ss = SpreadsheetApp.openById(WORKER_CONFIG.SPREADSHEET_ID);
+  const q = ss.getSheetByName(WORKER_CONFIG.QUEUE_SHEET_NAME);
+  if (!q) throw new Error("Queue sheet not found.");
+
+  const values = q.getDataRange().getValues();
+  if (values.length <= 1) return;
+
+  const header = values[0];
+  const idx = indexMapForQueue_(header);
+
+  // DONE の A だけ集める
+  const items = [];
+  for (let r = 1; r < values.length; r++) {
+    const row = values[r];
+    if (row[idx.jobType] !== A_CONFIG.JOB_TYPE) continue;
+    if (row[idx.status] !== "DONE") continue;
+
+    const jobId = String(row[idx.jobId] || "");
+    const createdAt = row[idx.createdAt];
+    const payload = safeJsonParse_(row[idx.payloadJson]);
+
+    const theme = extractThemeFromPayload_(payload) || "(no theme)";
+    const filePath = buildFilePathFromJobId_(jobId);
+    const pageUrl =
+      A_CONFIG.GITHUB.PAGES_URL + filePath.replace(/^docs\//, "").replace(/index\.html$/, "");
+
+    items.push({
+      jobId,
+      theme,
+      createdAt: createdAt ? new Date(createdAt) : null,
+      pageUrl,
+    });
+  }
+
+  // 新しい順
+  items.sort((a, b) => (b.createdAt?.getTime?.() || 0) - (a.createdAt?.getTime?.() || 0));
+
+  const indexHtml = renderJobsIndexHtml_(items);
+
+  upsertFileToGitHub_(
+    A_CONFIG.GITHUB.OWNER,
+    A_CONFIG.GITHUB.REPO,
+    A_CONFIG.GITHUB.BRANCH,
+    "docs/index.html",
+    indexHtml,
+    `Update docs/index.html (items=${items.length})`
+  );
+}
+
+/** _QUEUE ヘッダの index を取得（親GASの列に合わせる） */
+function indexMapForQueue_(header) {
+  const map = {};
+  header.forEach((h, i) => (map[String(h).trim()] = i));
+
+  const required = ["jobId", "createdAt", "jobType", "status", "payloadJson"];
+  required.forEach(k => {
+    if (!(k in map)) throw new Error(`Queue header missing: ${k}`);
+  });
+
+  return {
+    jobId: map.jobId,
+    createdAt: map.createdAt,
+    jobType: map.jobType,
+    status: map.status,
+    payloadJson: map.payloadJson,
+  };
+}
+
+function safeJsonParse_(s) {
+  try { return JSON.parse(s || "{}"); } catch (e) { return {}; }
+}
+
+/** 一覧HTML */
+function renderJobsIndexHtml_(items) {
+  const rows = items.map(it => {
+    const dateStr = it.createdAt
+      ? Utilities.formatDate(it.createdAt, "Asia/Tokyo", "yyyy-MM-dd HH:mm:ss")
+      : "";
+    return `
+      <tr>
+        <td>${escapeHtml_(dateStr)}</td>
+        <td>${escapeHtml_(it.theme)}</td>
+        <td><a href="${escapeHtml_(it.pageUrl)}" target="_blank" rel="noopener">Open</a></td>
+        <td><code>${escapeHtml_(it.jobId)}</code></td>
+      </tr>`;
+  }).join("");
+
+  return `<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Jobs Index</title>
+  <style>
+    body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,"Noto Sans JP",sans-serif;margin:32px;line-height:1.6;}
+    table{border-collapse:collapse;width:100%;max-width:1200px;}
+    th,td{border:1px solid #e5e7eb;padding:10px;vertical-align:top;}
+    th{background:#f8fafc;text-align:left;}
+    code{font-size:12px;}
+    .meta{color:#6b7280;font-size:13px;margin-bottom:12px;}
+  </style>
+</head>
+<body>
+  <h1>Jobs Index</h1>
+  <div class="meta">Generated from _QUEUE (A_HTML_GITHUB / DONE). Count: ${items.length}</div>
+  <table>
+    <thead>
+      <tr>
+        <th>Created</th>
+        <th>Theme</th>
+        <th>URL</th>
+        <th>JobId</th>
+      </tr>
+    </thead>
+    <tbody>
+      ${rows || `<tr><td colspan="4">No DONE jobs yet.</td></tr>`}
+    </tbody>
+  </table>
+</body>
+</html>`;
 }

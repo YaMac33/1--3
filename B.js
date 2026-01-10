@@ -286,3 +286,129 @@ function escapeHtml_(s) {
     .replaceAll('"', '&quot;')
     .replaceAll("'", '&#39;');
 }
+
+// ===== ワーカー共通設定 =====
+const WORKER_CONFIG = {
+  SPREADSHEET_ID: "1j5bCNucxL9QVS_iq_RYaeL1_vWTsxHArUSJuRzhQmiw",
+  QUEUE_SHEET_NAME: "_QUEUE",
+  MAX_PER_RUN: 3,              // 1回の実行で処理する最大件数
+  LOCK_SECONDS: 30,
+};
+
+// ★A/B/Cごとに変える
+const JOB_TYPE = "B_BLOG_WP"; // Aは "A_HTML_GITHUB", Cは "C_SLIDES_GEN"
+
+/**
+ * 初回だけ手動実行：時間トリガーを作る（例：1分毎）
+ */
+function initWorkerTrigger() {
+  // 既存の重複トリガーを削除
+  ScriptApp.getProjectTriggers().forEach(t => {
+    if (t.getHandlerFunction() === "runWorker") ScriptApp.deleteTrigger(t);
+  });
+
+  ScriptApp.newTrigger("runWorker")
+    .timeBased()
+    .everyMinutes(1)
+    .create();
+
+  Logger.log("✅ Worker trigger created: runWorker every 1 minute");
+}
+
+/**
+ * 時間主導でキューを消化する
+ */
+function runWorker() {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(WORKER_CONFIG.LOCK_SECONDS * 1000);
+
+  try {
+    const ss = SpreadsheetApp.openById(WORKER_CONFIG.SPREADSHEET_ID);
+    const q = ss.getSheetByName(WORKER_CONFIG.QUEUE_SHEET_NAME);
+    if (!q) throw new Error("Queue sheet not found.");
+
+    const values = q.getDataRange().getValues();
+    if (values.length <= 1) return;
+
+    const header = values[0];
+    const idx = indexMap_(header);
+
+    let processed = 0;
+
+    for (let r = 1; r < values.length; r++) {
+      if (processed >= WORKER_CONFIG.MAX_PER_RUN) break;
+
+      const row = values[r];
+      const jobType = row[idx.jobType];
+      const status  = row[idx.status];
+
+      if (jobType !== JOB_TYPE) continue;
+      if (status !== "PENDING") continue;
+
+      const sheetRow = r + 1; // シート上の行番号
+
+      // RUNNINGへ
+      updateQueueRow_(q, sheetRow, idx, { status: "RUNNING", updatedAt: new Date(), lastError: "" });
+
+      try {
+        const payload = JSON.parse(row[idx.payloadJson] || "{}");
+
+        // ★ここに本処理を差し込む（今はダミー）
+        doJob_(payload);
+
+        updateQueueRow_(q, sheetRow, idx, { status: "DONE", updatedAt: new Date() });
+      } catch (err) {
+        const retry = Number(row[idx.retryCount] || 0) + 1;
+        updateQueueRow_(q, sheetRow, idx, {
+          status: "ERROR",
+          retryCount: retry,
+          lastError: String(err && err.stack ? err.stack : err),
+          updatedAt: new Date(),
+        });
+      }
+
+      processed++;
+    }
+
+    Logger.log(`✅ runWorker done. jobType=${JOB_TYPE} processed=${processed}`);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * 本処理（まずはダミーでOK）
+ * payload.namedValues などからテーマを取り出して処理する想定
+ */
+function doJob_(payload) {
+  // 例：フォームの設問「テーマ」を取り出す（存在しない場合もあるので注意）
+  const nv = payload.namedValues || {};
+  const themeArr = nv["テーマ"] || nv["theme"] || [];
+  const theme = Array.isArray(themeArr) ? themeArr[0] : "";
+
+  Logger.log(`[${JOB_TYPE}] doing job... theme=${theme}`);
+  // TODO: A/B/C の実処理に置き換える
+}
+
+/** ヘッダ名→列index */
+function indexMap_(header) {
+  const map = {};
+  header.forEach((h, i) => map[String(h).trim()] = i);
+
+  const required = ["jobType","status","payloadJson","retryCount","lastError","updatedAt"];
+  required.forEach(k => {
+    if (!(k in map)) throw new Error(`Queue header missing: ${k}`);
+  });
+
+  return map;
+}
+
+/** キュー行を部分更新 */
+function updateQueueRow_(sheet, rowNum, idx, patch) {
+  const now = patch.updatedAt || new Date();
+
+  if (patch.status != null) sheet.getRange(rowNum, idx.status + 1).setValue(patch.status);
+  if (patch.retryCount != null) sheet.getRange(rowNum, idx.retryCount + 1).setValue(patch.retryCount);
+  if (patch.lastError != null) sheet.getRange(rowNum, idx.lastError + 1).setValue(patch.lastError);
+  sheet.getRange(rowNum, idx.updatedAt + 1).setValue(now);
+}
